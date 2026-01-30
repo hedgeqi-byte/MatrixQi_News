@@ -6,6 +6,7 @@ from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 from datetime import datetime, timedelta
 import pytz
 import os
+import re
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -67,8 +68,9 @@ def normalize_link(raw):
         
         return norm.lower()
     except Exception:
-        # Fallback: strip whitespace and lower-case
-        return url_str.replace('//+$', '').lower()
+        # Fallback: strip whitespace and lower-case, remove trailing slashes
+        import re
+        return re.sub(r'/+$', '', url_str).lower()
 
 
 def normalize_title(raw):
@@ -98,6 +100,17 @@ def store_news():
         # Get feed items
         items = feed.entries if feed.entries else []
         
+        # Debug: Print first item structure to understand feed format
+        if items and len(items) > 0:
+            first_item = items[0]
+            print(f"Sample feed item keys: {list(first_item.keys())}")
+            print(f"Has 'summary': {first_item.get('summary') is not None}")
+            print(f"Has 'description': {first_item.get('description') is not None}")
+            if first_item.get('summary'):
+                print(f"Summary value (first 150 chars): {str(first_item.get('summary'))[:150]}")
+            if first_item.get('description'):
+                print(f"Description value (first 150 chars): {str(first_item.get('description'))[:150]}")
+        
         if len(items) == 0:
             return jsonify({
                 'message': 'No items parsed from feed',
@@ -110,7 +123,42 @@ def store_news():
         for it in items:
             title = it.get('title', '') or ''
             link = it.get('link', '') or ''
-            description = it.get('description', '') or it.get('summary', '') or it.get('content', [{}])[0].get('value', '') if isinstance(it.get('content'), list) else ''
+            
+            # Extract description - RSS 2.0 maps <description> to 'summary' in feedparser
+            # Try summary first (RSS 2.0 standard)
+            description = ''
+            if it.get('summary'):
+                summary_val = it.get('summary')
+                if isinstance(summary_val, str):
+                    description = summary_val
+                elif isinstance(summary_val, dict):
+                    description = summary_val.get('value', '') or summary_val.get('content', '')
+            
+            # Try description field (some feeds use this)
+            if not description and it.get('description'):
+                desc_val = it.get('description')
+                if isinstance(desc_val, str):
+                    description = desc_val
+                elif isinstance(desc_val, dict):
+                    description = desc_val.get('value', '') or desc_val.get('content', '')
+            
+            # Try content field (Atom feeds, can be list or dict)
+            if not description and it.get('content'):
+                content_val = it.get('content')
+                if isinstance(content_val, list) and len(content_val) > 0:
+                    # Try first content item
+                    first_content = content_val[0]
+                    if isinstance(first_content, dict):
+                        description = first_content.get('value', '') or first_content.get('content', '')
+                elif isinstance(content_val, dict):
+                    description = content_val.get('value', '') or content_val.get('content', '')
+            
+            # Try subtitle as fallback
+            if not description and it.get('subtitle'):
+                subtitle_val = it.get('subtitle')
+                if isinstance(subtitle_val, str):
+                    description = subtitle_val
+            
             pub_date = it.get('published', '') or it.get('updated', '') or ''
             
             norm_link = normalize_link(link)
@@ -135,10 +183,22 @@ def store_news():
                 'inserted': 0
             })
         
-        # Fetch existing rows from DB
+        # Fetch existing rows from DB (fetch all to ensure proper deduplication)
         try:
-            existing_response = supabase.table('news').select('link, title, date').execute()
-            existing_rows = existing_response.data if existing_response.data else []
+            # Fetch all existing rows - Supabase default limit is 1000, but we'll fetch more if needed
+            existing_rows = []
+            page_size = 1000
+            offset = 0
+            
+            while True:
+                response = supabase.table('news').select('link, title, date').range(offset, offset + page_size - 1).execute()
+                batch = response.data if response.data else []
+                if not batch:
+                    break
+                existing_rows.extend(batch)
+                if len(batch) < page_size:
+                    break
+                offset += page_size
         except Exception as select_err:
             print(f'Supabase select warning: {select_err}')
             existing_rows = []
@@ -157,6 +217,8 @@ def store_news():
                 existing_links_set.add(n_l)
             if n_t or d:
                 existing_title_date_set.add(f"{n_t}||{d}")
+        
+        print(f'Deduplication sets: {len(existing_links_set)} unique links, {len(existing_title_date_set)} unique title+date combinations')
         
         # Decide which to insert
         to_insert = []
@@ -192,6 +254,8 @@ def store_news():
             else:
                 if not it['norm_link']:
                     skipped['duplicateTitleDate'] += 1
+        
+        print(f'Deduplication results: {len(to_insert)} to insert, {skipped}')
         
         if len(to_insert) == 0:
             return jsonify({
